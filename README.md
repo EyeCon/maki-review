@@ -41,3 +41,8 @@ and identifies commits by change ID. Otherwise it falls back to git.
 ## Install
 
 Copy `review.lua` into your maki plugins directory.
+
+## Tests
+
+`sh tests/run.sh` runs the parser and comment-logic suite against the real
+plugin code (needs `luau` on `$PATH`; the maki host API is stubbed).

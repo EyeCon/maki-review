@@ -460,18 +460,26 @@ local function vcs_commit_changes(rev)
   return git_commit_changes(rev)
 end
 
--- Removes invalid UTF-8 bytes, keeping everything else intact.
+-- Removes invalid UTF-8 sequences, keeping the valid characters.
 local function sanitize_utf8(s)
   if not s or s == "" then return s end
-  local ok = pcall(utf8.len, s)
-  if ok then return s end
-  -- Extract valid UTF-8 characters, skip invalid bytes
-  local out, i, n = {}, 1, #s
-  while i <= n do
-    local ok, next = pcall(utf8.offset, s, 1, i)
-    if ok then
-      out[#out + 1] = s:sub(i, next - 1)
-      i = next
+  local ok, n = pcall(utf8.len, s)
+  if ok and n then
+    return s
+  end
+  local out, i, len = {}, 1, #s
+  while i <= len do
+    local c = s:byte(i)
+    local size = c < 0x80 and 1
+      or (c >= 0xC2 and c <= 0xDF) and 2
+      or (c >= 0xE0 and c <= 0xEF) and 3
+      or (c >= 0xF0 and c <= 0xF4) and 4
+      or 0
+    local seq = size > 0 and s:sub(i, i + size - 1) or ""
+    local sok, slen = pcall(utf8.len, seq)
+    if size > 0 and #seq == size and sok and slen then
+      out[#out + 1] = seq
+      i = i + size
     else
       i = i + 1
     end
@@ -812,11 +820,13 @@ local function wrap(text, width)
         break
       end
       local head, tail = split_cells(raw, width)
-      -- Prefer breaking at whitespace within the last 20 cells.
-      local sp = head:match("^.*()%s")
-      if sp and sp > 1 and display_len(head:sub(sp)) <= 20 then
-        head = head:sub(1, sp - 1)
-        tail = raw:sub(sp + 1)
+      -- A cut mid-word falls back to the last whitespace within 20 cells.
+      if not tail:sub(1, 1):match("%s") and not head:sub(-1):match("%s") then
+        local sp = head:match("^.*()%s")
+        if sp and sp > 1 and display_len(head:sub(sp)) <= 20 then
+          head = head:sub(1, sp - 1)
+          tail = raw:sub(sp + 1)
+        end
       end
       lines[#lines + 1] = head
       raw = tail:gsub("^%s+", "")
@@ -891,7 +901,8 @@ local function fit_path(path, max)
     return path
   end
   local drop = math.max(display_len(path) - (max - 1), 1)
-  return "…" .. (split_cells(path, drop))
+  local _, tail = split_cells(path, drop)
+  return "…" .. tail
 end
 
 -- Builds a directory tree from a flat change list. Single-child directory
