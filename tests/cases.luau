@@ -267,6 +267,60 @@ ok(comment_in_range(change, dlines, 7, 8) == c, "comment_in_range: overlap found
 eq(comment_count(change), 1, "comment_count: one comment")
 comments[#comments] = nil
 
+--- build_prompt -------------------------------------------------------------
+
+comments[#comments + 1] = c
+maki.fs.root = function() return nil end
+vcs = nil
+local pg = build_prompt()
+ok(pg:find("## f", 1, true) ~= nil and pg:find("> x", 1, true) ~= nil,
+  "prompt: file heading and quoted comment")
+ok(pg:find("go through jj", 1, true) == nil, "prompt: no jj note on a git repository")
+maki.fs.root = function() return "/repo/.jj" end
+vcs = nil
+local pj = build_prompt()
+ok(pj:find("must go through jj (Jujutsu), never git", 1, true) ~= nil,
+  "prompt: jj note on a jj repository")
+maki.fs.root = function() return nil end
+vcs = nil
+comments[#comments] = nil
+
+--- submit --------------------------------------------------------------------
+
+session_calls = {}
+session_results.prompt = { "started" }
+comments[#comments + 1] = c
+ok(submit({ host = "sess-1" }, "current"), "submit current: succeeds")
+eq(session_calls[1].fn, "prompt", "submit current: uses session.prompt")
+eq(session_calls[1].opts and session_calls[1].opts.session, "sess-1",
+  "submit current: targets the host session")
+ok(session_calls[1].text:find("## f", 1, true) ~= nil, "submit current: sends the built prompt")
+eq(#comments, 0, "submit current: comments cleared")
+eq(flashes[#flashes], "Sent 1 comment(s) to this session", "submit current: flash")
+
+session_calls = {}
+session_results.prompt = { "queued" }
+comments[#comments + 1] = c
+ok(submit({ host = "sess-1" }, "current"), "submit current: queued succeeds")
+eq(flashes[#flashes], "Sent 1 comment(s) to this session (queued)", "submit current: queued flash")
+
+session_calls = {}
+session_results.prompt = { nil, "session gone" }
+comments[#comments + 1] = c
+eq(submit({ host = "sess-1" }, "current"), false, "submit current: error returns false")
+eq(#comments, 1, "submit current: error keeps comments")
+
+session_calls = {}
+session_results.new = { "new-1" }
+ok(submit(nil, "new"), "submit new: succeeds")
+eq(session_calls[1].fn, "new", "submit new: uses session.new")
+eq(session_calls[1].opts and session_calls[1].opts.focus, true, "submit new: focuses the new session")
+ok(session_calls[1].opts.prompt:find("## f", 1, true) ~= nil, "submit new: sends the built prompt")
+eq(#comments, 0, "submit new: comments cleared")
+eq(flashes[#flashes], "Sent 1 comment(s) to a new session", "submit new: flash")
+
+eq(submit(nil, "current"), false, "submit: no comments is a no-op")
+
 --- wrap / fit_path / sanitize_utf8 -----------------------------------------
 
 eq(table.concat(wrap("aaa bbb ccc", 7), "\n"), "aaa bbb\nccc", "wrap: greedy fill at width")
@@ -282,6 +336,45 @@ eq(fit_path("aaaaaaaaaa", 5), "…aaaa", "fit_path: keeps the tail")
 local cut = fit_path("日本語日本語", 4)
 eq(display_len(cut), 4, "fit_path: fits width")
 ok(utf8.len(cut) ~= nil, "fit_path: character boundary")
+
+--- ellipmid / hint_width / fit_hints -----------------------------------------
+
+local function dump_hints(pairs)
+  local out = {}
+  for _, p in ipairs(pairs) do
+    out[#out + 1] = p[1] .. "=" .. p[2]
+  end
+  return table.concat(out, " ")
+end
+
+eq(ellipmid("short", 10), "short", "ellipmid: passthrough")
+eq(ellipmid("abcdefghij", 6), "abc…ij", "ellipmid: keeps both ends")
+eq(ellipmid("abcdefghij", 1), "…", "ellipmid: single cell")
+eq(ellipmid("abcdefghij", 0), "", "ellipmid: zero budget")
+ok(display_len(ellipmid("日本語日本語", 5)) <= 5, "ellipmid: wide text fits")
+
+eq(hint_width({ { "a", "b" } }), 5, "hint_width: one pair")
+eq(hint_width({ { "ab", "cd" }, { "e", "f" } }), 11, "hint_width: two pairs")
+
+local HFULL = {
+  { "Enter", "diff" },
+  { "s", "here 3" },
+  { "S", "new 3" },
+  { "Esc", "close" },
+}
+eq(dump_hints(fit_hints(HFULL, 44)), "Enter=diff s=here 3 S=new 3 Esc=close",
+  "fit_hints: roomy budget keeps labels")
+eq(dump_hints(HFULL), "Enter=diff s=here 3 S=new 3 Esc=close",
+  "fit_hints: input pairs untouched")
+eq(dump_hints(fit_hints(HFULL, 30)), "Enter=diff s=he… 3 S=new 3",
+  "fit_hints: narrow budget ellipsizes widest label, drops trailing")
+eq(dump_hints(fit_hints(HFULL, 12)), "Enter=diff",
+  "fit_hints: tiny budget drops trailing pairs")
+ok(hint_width(fit_hints(HFULL, 30)) <= 30 and hint_width(fit_hints(HFULL, 12)) <= 12,
+  "fit_hints: result never exceeds budget")
+ok(hint_width({
+  { "Enter", "diff" }, { "s", "here 100" }, { "S", "new 100" }, { "Esc", "close" },
+}) <= 44, "fit_hints: widest files footer fits the design cap")
 
 eq(sanitize_utf8("héllo"), "héllo", "sanitize: valid passthrough")
 eq(sanitize_utf8("\255abc"), "abc", "sanitize: invalid byte dropped")

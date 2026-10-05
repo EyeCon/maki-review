@@ -12,7 +12,8 @@
 --   * Tab cycles the left panels; Enter/l focuses the diff, h/Esc goes back.
 --     In the diff: `c` comments the current line, `v` selects a range first,
 --     `d` deletes a comment.
---   * `s` submits all comments to a new focused maki session that fixes them.
+--   * `s` submits all comments to the current session (that fixes them),
+--     `S` to a new focused one.
 --
 -- VCS backend: when a `.jj` directory marks the repository (searched upward
 -- from the working directory), every VCS query goes through jj and commits
@@ -741,8 +742,11 @@ local function build_prompt()
     "If a comment is a question, answer it and apply any change the answer implies.",
     "Line numbers refer to the file content on the commented side of the diff",
     "(\"removed\" lines refer to the pre-change file).",
-    "",
   }
+  if vcs_backend() == "jj" then
+    p[#p + 1] = "All VCS operations in this repository must go through jj (Jujutsu), never git."
+  end
+  p[#p + 1] = ""
   for _, file in ipairs(order) do
     p[#p + 1] = "## " .. sanitize_utf8(file)
     for i, c in ipairs(by_file[file]) do
@@ -765,17 +769,34 @@ local function build_prompt()
   return table.concat(p, "\n")
 end
 
-local function submit(state)
+-- target: "current" sends the prompt to the session the review runs in
+-- (queued when that session is busy), "new" starts a fresh focused session.
+local function submit(state, target)
   if #comments == 0 then
     maki.ui.flash("No review comments yet — press c on a diff line first")
     return false
   end
   local n = #comments
   local prompt = build_prompt()
-  local _, err = maki.session.new({ prompt = prompt, focus = true })
-  if err then
-    maki.ui.flash("Failed to start session: " .. err)
-    return false
+  local sent
+  if target == "current" then
+    local res, err = maki.session.prompt(
+      prompt,
+      state and state.host and { session = state.host } or nil
+    )
+    if not res then
+      maki.ui.flash("Failed to send comments: " .. tostring(err))
+      return false
+    end
+    sent = "Sent " .. n .. " comment(s) to this session"
+      .. (res == "queued" and " (queued)" or "")
+  else
+    local _, err = maki.session.new({ prompt = prompt, focus = true })
+    if err then
+      maki.ui.flash("Failed to start session: " .. err)
+      return false
+    end
+    sent = "Sent " .. n .. " comment(s) to a new session"
   end
   comments = {}
   if state then
@@ -785,7 +806,7 @@ local function submit(state)
       end
     end
   end
-  maki.ui.flash("Sent " .. n .. " comment(s) to a new session")
+  maki.ui.flash(sent)
   return true
 end
 
@@ -903,6 +924,63 @@ local function fit_path(path, max)
   local drop = math.max(display_len(path) - (max - 1), 1)
   local _, tail = split_cells(path, drop)
   return "…" .. tail
+end
+
+-- Shortens `s` to `max` columns with an ellipsis in the middle, keeping
+-- both ends.
+local function ellipmid(s, max)
+  s = sanitize_utf8(s)
+  if display_len(s) <= max then
+    return s
+  end
+  if max <= 0 then
+    return ""
+  elseif max == 1 then
+    return "…"
+  end
+  local keep = max - 1
+  local head_w = math.ceil(keep / 2)
+  local tail_w = keep - head_w
+  local head = split_cells(s, head_w)
+  local _, tail = split_cells(s, math.max(display_len(s) - tail_w, 1))
+  return head .. "…" .. tail
+end
+
+-- Width the host's key-hint footer takes: one " key label" run per pair
+-- plus a trailing space (maki's hint_footer). The host widens a bordered
+-- float to fit its title and footer, so this must stay within the pane.
+local function hint_width(pairs)
+  local n = 1
+  for _, p in ipairs(pairs) do
+    n = n + 2 + display_len(p[1]) + display_len(p[2])
+  end
+  return n
+end
+
+-- Fits a key-hint footer into `budget` columns: middle-ellipsizes the
+-- widest labels first (down to 5 cells, or 1 for a lone pair), then drops
+-- the least important (last) pairs, so the float keeps its configured width
+-- instead of growing past its neighbours.
+local function fit_hints(pairs, budget)
+  local out = {}
+  for i, p in ipairs(pairs) do
+    out[i] = { p[1], p[2] }
+  end
+  while #out > 0 and hint_width(out) > budget do
+    local wi, ww = nil, 0
+    for i, p in ipairs(out) do
+      local w = display_len(p[2])
+      if w > ww then
+        wi, ww = i, w
+      end
+    end
+    if ww > (#out == 1 and 1 or 5) then
+      out[wi][2] = ellipmid(out[wi][2], ww - 1)
+    else
+      table.remove(out)
+    end
+  end
+  return out
 end
 
 -- Builds a directory tree from a flat change list. Single-child directory
@@ -1435,11 +1513,15 @@ local function redraw(state)
 
   local diff_active = state.pane == "diff" or state.centry ~= nil
 
-  local function panel_cfg(win, title, active, footer)
+  -- The host widens a bordered float to fit its title and footer, so fit
+  -- both into the pane width first; otherwise the active pane's hints pull
+  -- its border past its neighbours.
+  local function panel_cfg(win, title, active, footer, width)
+    local budget = math.max(width - 2, 1)
     win:set_config({
-      title = title,
+      title = ellipmid(title, budget),
       border = active and "double" or "rounded",
-      footer = active and footer or { { "Tab", "focus" } },
+      footer = fit_hints(active and footer or { { "Tab", "focus" } }, budget),
     })
   end
 
@@ -1449,9 +1531,11 @@ local function redraw(state)
     state.pane == "files" and not state.centry,
     {
       { "Enter", "diff" },
-      { "s", "submit " .. #comments },
+      { "s", "here " .. #comments },
+      { "S", "new " .. #comments },
       { "Esc", "close" },
-    }
+    },
+    state.lwidth
   )
 
   local ctitle, cfooter
@@ -1466,7 +1550,8 @@ local function redraw(state)
     state.cwin,
     ctitle,
     state.pane == "commits" and not state.centry,
-    cfooter
+    cfooter,
+    state.lwidth
   )
 
   panel_cfg(
@@ -1475,8 +1560,10 @@ local function redraw(state)
     state.pane == "comments" and not state.centry,
     {
       { "d", "delete" },
-      { "s", "submit " .. #comments },
-    }
+      { "s", "here " .. #comments },
+      { "S", "new " .. #comments },
+    },
+    state.lwidth
   )
 
   local rtitle = " Diff "
@@ -1494,18 +1581,20 @@ local function redraw(state)
       .. state.change.dels
       .. " "
   end
+  local rbudget = math.max(state.rwidth - 2, 1)
   state.rwin:set_config({
-    title = rtitle,
+    title = ellipmid(rtitle, rbudget),
     border = diff_active and "double" or "rounded",
-    footer = state.centry
+    footer = fit_hints(state.centry
         and { { "Enter", "save" }, { "Esc", "cancel" } }
       or (diff_active and {
         { "c", "comment" },
         { "v", state.vstart and "cancel select" or "select" },
         { "d", "delete" },
-        { "s", "submit " .. #comments },
+        { "s", "here " .. #comments },
+        { "S", "new " .. #comments },
         { "Esc", "back" },
-      } or { { "Enter", "diff" } }),
+      } or { { "Enter", "diff" } }), rbudget),
   })
 
   state.fwin:set_cursor(state.fcursor)
@@ -1941,6 +2030,7 @@ local function open_review()
     cbuf = maki.ui.buf(),
     mbuf = maki.ui.buf(),
     rbuf = maki.ui.buf(),
+    host = maki.session.current(), -- session the review runs in; submit targets it
     pane = "files",
     src = "files",
     wchanges = changes,
@@ -2028,7 +2118,12 @@ local function open_review()
     elseif key == "<Tab>" then
       set_pane(state, state.pane == "diff" and state.src or PANE_NEXT[state.pane])
     elseif key == "s" then
-      if submit(state) then
+      if submit(state, "current") then
+        return
+      end
+      redraw(state)
+    elseif key == "S" then
+      if submit(state, "new") then
         return
       end
       redraw(state)

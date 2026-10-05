@@ -2,7 +2,7 @@
 
 A [[maki](https://github.com/asaf/maki)](https://github.com/tontinton/maki) plugin that adds a `/review` command:
 a TUI for reviewing maki's changes, leaving inline comments on diff lines,
-and sending them back to a new maki session that fixes them.
+and sending them back to maki — into the current session or a new one.
 
 <img width="800" height="500" alt="recording2" src="https://github.com/user-attachments/assets/b84fb2dd-e995-4060-b15d-159d34f5d23a" />
 
@@ -15,7 +15,8 @@ and sending them back to a new maki session that fixes them.
 - **Comments** — every review comment written so far
 - **Diff pane** — syntax-highlighted diff with full-row tints; comment a line (`c`),
   select a range first (`v`), delete (`d`)
-- **Submit** — `s` sends all comments to a new focused maki session that addresses them
+- **Submit** — `s` sends all comments to the current session, `S` to a new
+  focused one; both address them
 - After each turn, a status flash reminds you when files changed
 
 ## Keys
@@ -28,7 +29,8 @@ and sending them back to a new maki session that fixes them.
 | `c` | comment on the current diff line |
 | `v` | start range selection |
 | `d` | delete comment |
-| `s` | submit comments to maki |
+| `s` | submit comments to this session |
+| `S` | submit comments to a new session |
 | `r` | refresh |
 | `q` | quit |
 

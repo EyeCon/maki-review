@@ -11,6 +11,17 @@ local function noop() end
 local canned = {}
 local ran_cmds = {}
 
+-- Canned (value, err) results for the maki.session stubs, keyed by function
+-- name ("current" | "new" | "prompt"); session_calls records every call as
+-- { fn, text?, opts? } in call order. flashes collects maki.ui.flash texts.
+local session_results = {
+  current = { "sess-1" },
+  new = { "new-1" },
+  prompt = { "started" },
+}
+local session_calls = {}
+local flashes = {}
+
 maki = {
   api = {
     register_command = noop,
@@ -18,7 +29,9 @@ maki = {
   },
   log = { debug = noop, info = noop, warn = noop, error = noop },
   ui = {
-    flash = noop,
+    flash = function(msg)
+      flashes[#flashes + 1] = msg
+    end,
     display_width = function(s)
       local ok, n = pcall(utf8.len, s)
       return (ok and n) or #s
@@ -64,6 +77,23 @@ maki = {
   },
   fs = { root = function() return nil end },
   uv = { cwd = function() return "." end },
+  session = {
+    current = function()
+      session_calls[#session_calls + 1] = { fn = "current" }
+      local r = session_results.current or {}
+      return r[1], r[2]
+    end,
+    new = function(opts)
+      session_calls[#session_calls + 1] = { fn = "new", opts = opts }
+      local r = session_results.new or {}
+      return r[1], r[2]
+    end,
+    prompt = function(text, opts)
+      session_calls[#session_calls + 1] = { fn = "prompt", text = text, opts = opts }
+      local r = session_results.prompt or {}
+      return r[1], r[2]
+    end,
+  },
 }
 
 require = function(name)
