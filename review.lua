@@ -40,8 +40,8 @@ local SEL_TINT = { "#58a6ff", 0.30 }
 local COM_TINT = { "#e3b341", 0.22 }
 
 -- One shared comment store per maki process, survives window close/reopen.
--- Entry: { file, text, anchor ("new"|"old"), new_start, new_end,
---          old_start, old_end, snippet }
+-- Entry: { file, commit, text, anchor ("new"|"old"), old_lines, new_lines
+--          (sets of covered file line numbers), snippet }
 local comments = {}
 
 --- shell helpers -----------------------------------------------------------
@@ -51,14 +51,14 @@ local function sh_quote(s)
 end
 
 -- Runs a shell command, returns trimmed stdout or nil, err.
-local function run(cmd)
+local function run(cmd, allow_one)
   local id = maki.fn.jobstart(cmd)
   local res = maki.fn.jobwait(id, 15000)
   if not res then
     return nil, "timed out: " .. cmd
   end
-  -- git diff exits 1 when files differ (--no-index); only treat >1 as failure.
-  if res.exit_code > 1 then
+  -- `git diff --no-index` exits 1 when files differ; opt in per call.
+  if res.exit_code > 1 or (res.exit_code == 1 and not allow_one) then
     local err = (res.stderr or ""):match("^%s*(.-)%s*$")
     return nil, err ~= "" and err or ("exit " .. res.exit_code)
   end
@@ -129,34 +129,81 @@ local function comment_count(change)
   return n
 end
 
--- Unescapes a C-quoted path from a git diff header ("a/path b/path").
+-- Unescapes a C-quoted path from a jj `diff --git` header ("a/path b/path").
+local GIT_ESCAPES = {
+  a = "\a",
+  b = "\b",
+  f = "\f",
+  n = "\n",
+  r = "\r",
+  t = "\t",
+  v = "\v",
+  ["\\"] = "\\",
+  ['"'] = '"',
+}
+
 local function unquote_git_path(p)
   if p:sub(1, 1) ~= '"' then
     return p
   end
   p = p:sub(2, -2)
-  p = p:gsub("\\(%d%d?%d?)", function(o)
-    return string.char(tonumber(o, 8))
-  end)
-  return (p:gsub("\\(.)", {
-    a = "\a",
-    b = "\b",
-    f = "\f",
-    n = "\n",
-    r = "\r",
-    t = "\t",
-    v = "\v",
-    ["\\"] = "\\",
-    ['"'] = '"',
-  }))
+  local out, i, n = {}, 1, #p
+  while i <= n do
+    local c = p:sub(i, i)
+    if c ~= "\\" then
+      out[#out + 1] = c
+      i = i + 1
+    else
+      local nxt = p:sub(i + 1, i + 1)
+      local esc = GIT_ESCAPES[nxt]
+      if esc then
+        out[#out + 1] = esc
+        i = i + 2
+      elseif nxt:match("%d") then
+        -- Git writes octal escapes as three digits = one raw byte.
+        out[#out + 1] = string.char(tonumber(p:sub(i + 1, i + 3), 8) % 256)
+        i = i + 4
+      else
+        out[#out + 1] = nxt
+        i = i + 2
+      end
+    end
+  end
+  return table.concat(out)
 end
 
--- Applies git numstat lines ("adds<TAB>dels<TAB>path") to name-status changes.
-local function apply_numstat(changes, seen, numstat)
-  for line in numstat:gmatch("[^\n]+") do
-    local adds, dels, path = line:match("^(%S+)\t(%S+)\t(.+)$")
-    if path then
-      local idx = seen[path]
+-- Splits NUL-separated (`-z`) output into non-empty tokens.
+local function split0(s)
+  local out, pos = {}, 1
+  while true do
+    local i = s:find("\0", pos, true)
+    if not i then
+      if pos <= #s then
+        out[#out + 1] = s:sub(pos)
+      end
+      return out
+    end
+    if i > pos then
+      out[#out + 1] = s:sub(pos, i - 1)
+    end
+    pos = i + 1
+  end
+end
+
+-- Applies `git diff --numstat -z` output ("adds<TAB>dels<TAB>path" records;
+-- a rename has an empty path field followed by the old and new paths) to the
+-- changes built from name-status.
+local function apply_numstat(changes, seen, out)
+  local toks = split0(out)
+  local i = 1
+  while i <= #toks do
+    local adds, dels, path = toks[i]:match("^([^\t]*)\t([^\t]*)\t(.*)$")
+    if adds then
+      if path == "" then
+        path = toks[i + 2] -- rename: [i + 1] is the old path
+        i = i + 2
+      end
+      local idx = path and seen[path]
       if idx then
         if adds == "-" then
           changes[idx].binary = true
@@ -166,6 +213,32 @@ local function apply_numstat(changes, seen, numstat)
         end
       end
     end
+    i = i + 1
+  end
+end
+
+-- Parses `git diff --name-status -z` output (NUL-separated tokens: status,
+-- path; a rename or copy lists the old path before the new one) and appends
+-- to `changes`/`seen`.
+local function apply_name_status(changes, seen, out, commit)
+  local toks = split0(out)
+  local i = 1
+  while i <= #toks do
+    local status = toks[i]
+    local path = toks[i + 1]
+    if status:match("^[RC]") and toks[i + 2] then
+      path = toks[i + 2]
+      i = i + 1
+    end
+    if path then
+      seen[path] = #changes + 1
+      local ch = { path = path, status = status:sub(1, 1), adds = 0, dels = 0 }
+      if commit then
+        ch.commit = commit
+      end
+      changes[#changes + 1] = ch
+    end
+    i = i + 2
   end
 end
 
@@ -207,21 +280,23 @@ local function git_changes()
 
   local changes, seen = {}, {}
 
-  local ns = run("git diff --no-color --name-status HEAD") or ""
-  for line in ns:gmatch("[^\n]+") do
-    local status, rest = line:match("^(%S+)\t(.+)$")
-    if status then
-      local path = rest:match("\t(.+)$") or rest -- renames: keep new path
-      seen[path] = #changes + 1
-      changes[#changes + 1] =
-        { path = path, status = status:sub(1, 1), adds = 0, dels = 0 }
-    end
+  local ns, ns_err = run("git diff --no-color --name-status HEAD -z")
+  if not ns then
+    return nil, ns_err
   end
+  apply_name_status(changes, seen, ns)
 
-  apply_numstat(changes, seen, run("git diff --no-color --numstat HEAD") or "")
+  local numstat, num_err = run("git diff --no-color --numstat HEAD -z")
+  if not numstat then
+    return nil, num_err
+  end
+  apply_numstat(changes, seen, numstat)
 
-  local untracked = run("git ls-files --others --exclude-standard") or ""
-  for path in untracked:gmatch("[^\n]+") do
+  local untracked, un_err = run("git ls-files --others --exclude-standard -z")
+  if not untracked then
+    return nil, un_err
+  end
+  for _, path in ipairs(split0(untracked)) do
     if not seen[path] then
       changes[#changes + 1] =
         { path = path, status = "?", adds = 0, dels = 0, untracked = true }
@@ -232,6 +307,17 @@ local function git_changes()
     return a.path < b.path
   end)
   return changes
+end
+
+-- jj renames in `diff --summary` look like "prefix/{old name => new name}";
+-- returns the new path with the shared prefix (and suffix) reattached.
+local function jj_new_path(rest)
+  local prefix, inner, suffix = rest:match("^(.*){(.* => .*)}(.*)$")
+  if not inner then
+    return rest
+  end
+  local new = inner:match("^.- => (.*)$")
+  return prefix .. new .. suffix
 end
 
 -- jj: files of the working-copy change vs its parent. New files picked up by
@@ -245,24 +331,29 @@ local function jj_changes()
   for line in summary:gmatch("[^\n]+") do
     local status, rest = line:match("^(%S)%s+(.+)$")
     if status then
-      local path = rest:match("%{.* => (.*)%}$") or rest -- renames: new path
+      local path = jj_new_path(rest)
       seen[path] = #changes + 1
       changes[#changes + 1] =
         { path = path, status = status, adds = 0, dels = 0 }
     end
   end
-  apply_jj_stats(changes, seen, run("jj diff --git") or "")
+  local raw, raw_err = run("jj diff --git")
+  if not raw then
+    return nil, raw_err
+  end
+  apply_jj_stats(changes, seen, raw)
   table.sort(changes, function(a, b)
     return a.path < b.path
   end)
   return changes
 end
 
--- Parses tab-separated "rev<TAB>subject<TAB>when" log lines.
+-- Parses tab-separated "rev<TAB>subject<TAB>when" log lines. The subject
+-- may contain tabs, so the last tab separates `when`.
 local function parse_log(out)
   local log = {}
   for line in out:gmatch("[^\n]+") do
-    local rev, subject, when = line:match("^(%S+)\t(.-)\t(.-)$")
+    local rev, subject, when = line:match("^(%S+)\t(.*)\t([^\t]*)$")
     if rev then
       log[#log + 1] = { rev = rev, subject = subject, when = when }
     end
@@ -292,32 +383,26 @@ local function jj_log()
 end
 
 -- Files changed by one commit; same shape as git_changes, plus .commit.
+-- --diff-merges=first-parent makes merge commits show the changes they
+-- brought in (diff-tree prints nothing at all for merges otherwise).
 local function git_commit_changes(rev)
   local changes, seen = {}, {}
-  local ns, err =
-    run("git diff-tree -r --root --no-commit-id --name-status " .. rev)
+  local ns, err = run(
+    "git diff-tree -r --root --no-commit-id --name-status -z --diff-merges=first-parent "
+      .. sh_quote(rev)
+  )
   if not ns then
     return nil, err
   end
-  for line in ns:gmatch("[^\n]+") do
-    local status, rest = line:match("^(%S+)\t(.+)$")
-    if status then
-      local path = rest:match("\t(.+)$") or rest
-      seen[path] = #changes + 1
-      changes[#changes + 1] = {
-        path = path,
-        status = status:sub(1, 1),
-        adds = 0,
-        dels = 0,
-        commit = rev,
-      }
-    end
-  end
-  apply_numstat(
-    changes,
-    seen,
-    run("git diff-tree -r --root --no-commit-id --numstat " .. rev) or ""
+  apply_name_status(changes, seen, ns, rev)
+  local numstat, num_err = run(
+    "git diff-tree -r --root --no-commit-id --numstat -z --diff-merges=first-parent "
+      .. sh_quote(rev)
   )
+  if not numstat then
+    return nil, num_err
+  end
+  apply_numstat(changes, seen, numstat)
   table.sort(changes, function(a, b)
     return a.path < b.path
   end)
@@ -334,13 +419,17 @@ local function jj_commit_changes(rev)
   for line in summary:gmatch("[^\n]+") do
     local status, rest = line:match("^(%S)%s+(.+)$")
     if status then
-      local path = rest:match("%{.* => (.*)%}$") or rest
+      local path = jj_new_path(rest)
       seen[path] = #changes + 1
       changes[#changes + 1] =
         { path = path, status = status, adds = 0, dels = 0, commit = rev }
     end
   end
-  apply_jj_stats(changes, seen, run("jj diff --git -r " .. sh_quote(rev)) or "")
+  local raw, raw_err = run("jj diff --git -r " .. sh_quote(rev))
+  if not raw then
+    return nil, raw_err
+  end
+  apply_jj_stats(changes, seen, raw)
   table.sort(changes, function(a, b)
     return a.path < b.path
   end)
@@ -371,6 +460,25 @@ local function vcs_commit_changes(rev)
   return git_commit_changes(rev)
 end
 
+-- Removes invalid UTF-8 bytes, keeping everything else intact.
+local function sanitize_utf8(s)
+  if not s or s == "" then return s end
+  local ok = pcall(utf8.len, s)
+  if ok then return s end
+  -- Extract valid UTF-8 characters, skip invalid bytes
+  local out, i, n = {}, 1, #s
+  while i <= n do
+    local ok, next = pcall(utf8.offset, s, 1, i)
+    if ok then
+      out[#out + 1] = s:sub(i, next - 1)
+      i = next
+    else
+      i = i + 1
+    end
+  end
+  return table.concat(out)
+end
+
 -- Parses unified diff text into { kind, text, old_ln, new_ln } lines.
 -- kind: "hunk" | "ctx" | "add" | "del". Meta lines are dropped.
 local function parse_diff(raw)
@@ -386,19 +494,21 @@ local function parse_diff(raw)
     if os_ then
       old_ln, new_ln = tonumber(os_), tonumber(ns_)
       in_hunk = true
-      out[#out + 1] = { kind = "hunk", text = line }
+      out[#out + 1] = { kind = "hunk", text = sanitize_utf8(line) }
     elseif in_hunk then
       local c = line:sub(1, 1)
       if c == "+" then
-        out[#out + 1] = { kind = "add", text = line:sub(2), new_ln = new_ln }
+        out[#out + 1] =
+          { kind = "add", text = sanitize_utf8(line:sub(2)), new_ln = new_ln }
         new_ln = new_ln + 1
       elseif c == "-" then
-        out[#out + 1] = { kind = "del", text = line:sub(2), old_ln = old_ln }
+        out[#out + 1] =
+          { kind = "del", text = sanitize_utf8(line:sub(2)), old_ln = old_ln }
         old_ln = old_ln + 1
       elseif c == " " then
         out[#out + 1] = {
           kind = "ctx",
-          text = line:sub(2),
+          text = sanitize_utf8(line:sub(2)),
           old_ln = old_ln,
           new_ln = new_ln,
         }
@@ -415,7 +525,7 @@ local function parse_diff(raw)
 end
 
 local function get_diff(change)
-  local cmd
+  local cmd, allow_one
   if vcs_backend() == "jj" then
     if change.commit then
       cmd = "jj diff --git -r "
@@ -426,16 +536,19 @@ local function get_diff(change)
       cmd = "jj diff --git -- " .. sh_quote(change.path)
     end
   elseif change.commit then
-    cmd = "git show --no-color --format= "
-      .. change.commit
+    -- --diff-merges=first-parent makes merge commits diff against their first
+    -- parent (git show hides merge diffs otherwise).
+    cmd = "git show --no-color --format= --diff-merges=first-parent "
+      .. sh_quote(change.commit)
       .. " -- "
       .. sh_quote(change.path)
   elseif change.untracked then
     cmd = "git diff --no-color --no-index -- /dev/null " .. sh_quote(change.path)
+    allow_one = true -- exits 1 when the file differs from /dev/null
   else
     cmd = "git diff --no-color HEAD -- " .. sh_quote(change.path)
   end
-  local raw, err = run(cmd)
+  local raw, err = run(cmd, allow_one)
   if not raw then
     return nil, err
   end
@@ -486,9 +599,9 @@ end
 
 local function covers(c, dl)
   if dl.kind == "del" then
-    return c.old_start and dl.old_ln and dl.old_ln >= c.old_start and dl.old_ln <= c.old_end
+    return dl.old_ln ~= nil and c.old_lines[dl.old_ln]
   end
-  return c.new_start and dl.new_ln and dl.new_ln >= c.new_start and dl.new_ln <= c.new_end
+  return dl.new_ln ~= nil and c.new_lines[dl.new_ln]
 end
 
 local function comment_at(change, dl)
@@ -500,18 +613,36 @@ local function comment_at(change, dl)
   return nil
 end
 
+-- First comment covering any diff line in [from, to], with its index.
+local function comment_in_range(change, dlines, from, to)
+  for i = from, to do
+    local c, idx = comment_at(change, dlines[i])
+    if c then
+      return c, idx
+    end
+  end
+  return nil
+end
+
 -- Builds a comment record from a contiguous range of parsed diff lines.
+-- old_lines/new_lines hold exactly the file line numbers the comment covers
+-- on each side: line numbers restart at every hunk header, so min/max ranges
+-- would over-match lines in other hunks.
 local function make_comment(change, dlines, from, to, text)
-  local c = { file = change.path, commit = change.commit, text = text }
+  local c = {
+    file = change.path,
+    commit = change.commit,
+    text = text,
+    old_lines = {},
+    new_lines = {},
+  }
   for i = from, to do
     local dl = dlines[i]
     if dl.new_ln then
-      c.new_start = math.min(c.new_start or dl.new_ln, dl.new_ln)
-      c.new_end = math.max(c.new_end or dl.new_ln, dl.new_ln)
+      c.new_lines[dl.new_ln] = true
     end
     if dl.old_ln then
-      c.old_start = math.min(c.old_start or dl.old_ln, dl.old_ln)
-      c.old_end = math.max(c.old_end or dl.old_ln, dl.old_ln)
+      c.old_lines[dl.old_ln] = true
     end
   end
   -- The range may end on a hunk header row; anchor on the last real diff
@@ -524,20 +655,23 @@ local function make_comment(change, dlines, from, to, text)
   end
 
   -- Snapshot the hunk context so the prompt survives later refreshes.
-  local snippet = {}
+  local snippet, hdr = {}, nil
   for i = from - 1, 1, -1 do
     if dlines[i].kind == "hunk" then
+      hdr = i
       snippet[1] = dlines[i].text
       break
     end
   end
   local lo, hi = math.max(from - 2, 1), math.min(to + 2, #dlines)
   for i = lo, hi do
-    local dl = dlines[i]
-    if dl.kind ~= "hunk" then
-      local prefix = dl.kind == "add" and "+" or dl.kind == "del" and "-" or " "
-      local marked = (i >= from and i <= to) and "  <<< comment applies here" or ""
-      if #snippet < 80 then
+    if i ~= hdr then
+      local dl = dlines[i]
+      if dl.kind == "hunk" then
+        snippet[#snippet + 1] = dl.text
+      elseif #snippet < 80 then
+        local prefix = dl.kind == "add" and "+" or dl.kind == "del" and "-" or " "
+        local marked = (i >= from and i <= to) and "  <<< comment applies here" or ""
         snippet[#snippet + 1] = prefix .. dl.text .. marked
       end
     end
@@ -546,17 +680,37 @@ local function make_comment(change, dlines, from, to, text)
   return c
 end
 
-local function line_range_label(c)
-  if c.anchor == "old" then
-    if c.old_start == c.old_end then
-      return "removed line " .. c.old_start
+-- Contiguous runs of covered file lines on the anchor side ("2-3, 9"),
+-- plus the first covered line and how many are covered.
+local function anchor_runs(c)
+  local set = c.anchor == "old" and c.old_lines or c.new_lines
+  local ns = {}
+  for ln in pairs(set) do
+    ns[#ns + 1] = ln
+  end
+  table.sort(ns)
+  local runs = {}
+  for _, ln in ipairs(ns) do
+    local last = runs[#runs]
+    if last and ln == last[2] + 1 then
+      last[2] = ln
+    else
+      runs[#runs + 1] = { ln, ln }
     end
-    return "removed lines " .. c.old_start .. "-" .. c.old_end
   end
-  if c.new_start == c.new_end then
-    return "line " .. c.new_start
+  local parts = {}
+  for _, r in ipairs(runs) do
+    parts[#parts + 1] = r[1] == r[2] and tostring(r[1]) or (r[1] .. "-" .. r[2])
   end
-  return "lines " .. c.new_start .. "-" .. c.new_end
+  return table.concat(parts, ", "), ns[1], #ns
+end
+
+local function line_range_label(c)
+  local where, _, n = anchor_runs(c)
+  if c.anchor == "old" then
+    return n == 1 and ("removed line " .. where) or ("removed lines " .. where)
+  end
+  return n == 1 and ("line " .. where) or ("lines " .. where)
 end
 
 --- submit ------------------------------------------------------------------
@@ -582,7 +736,7 @@ local function build_prompt()
     "",
   }
   for _, file in ipairs(order) do
-    p[#p + 1] = "## " .. file
+    p[#p + 1] = "## " .. sanitize_utf8(file)
     for i, c in ipairs(by_file[file]) do
       p[#p + 1] = ""
       local where = line_range_label(c)
@@ -629,6 +783,23 @@ end
 
 --- span helpers ------------------------------------------------------------
 
+local function display_len(s)
+  local ok, n = pcall(maki.ui.display_width, s)
+  if ok and n then
+    return n
+  end
+  return #s
+end
+
+-- Splits `s` at a display-cell boundary, never inside a character.
+local function split_cells(s, max)
+  local ok, t = pcall(maki.ui.truncate_text, s, max)
+  if ok and type(t) == "table" then
+    return t.head, t.tail
+  end
+  return s, ""
+end
+
 local function wrap(text, width)
   local lines = {}
   for raw in (text .. "\n"):gmatch("(.-)\n") do
@@ -636,48 +807,22 @@ local function wrap(text, width)
       lines[#lines + 1] = ""
     end
     while #raw > 0 do
-      if #raw <= width then
+      if display_len(raw) <= width then
         lines[#lines + 1] = raw
         break
       end
-      local cut = width
-      for i = width, math.max(width - 20, 1), -1 do
-        if raw:sub(i, i) == " " then
-          cut = i
-          break
-        end
+      local head, tail = split_cells(raw, width)
+      -- Prefer breaking at whitespace within the last 20 cells.
+      local sp = head:match("^.*()%s")
+      if sp and sp > 1 and display_len(head:sub(sp)) <= 20 then
+        head = head:sub(1, sp - 1)
+        tail = raw:sub(sp + 1)
       end
-      lines[#lines + 1] = raw:sub(1, cut)
-      raw = raw:sub(cut + 1):gsub("^%s+", "")
+      lines[#lines + 1] = head
+      raw = tail:gsub("^%s+", "")
     end
   end
   return lines
-end
-
-local function display_len(s)
-  local ok, n = pcall(utf8.len, s)
-  if ok and n then
-    return n
-  end
-  return #s
-end
-
-local function sanitize_utf8(s)
-  if not s or s == "" then return s end
-  local ok = pcall(utf8.len, s)
-  if ok then return s end
-  -- Extract valid UTF-8 characters, skip invalid bytes
-  local out, i, n = {}, 1, #s
-  while i <= n do
-    local ok, next = pcall(utf8.offset, s, 1, i)
-    if ok then
-      out[#out + 1] = s:sub(i, next - 1)
-      i = next
-    else
-      i = i + 1
-    end
-  end
-  return table.concat(out)
 end
 
 local function spans_len(spans)
@@ -707,19 +852,29 @@ local function restyle(spans, style)
 end
 
 -- Returns copies of `spans` with `bg` added to each span's style,
--- keeping syntax foreground colors.
+-- keeping syntax foreground colors (named styles resolve through the theme).
 local function with_bg(spans, bg)
   local out = {}
   for _, sp in ipairs(spans) do
     local s = sp[2]
-    local ns = { bg = bg }
-    if type(s) == "table" then
-      ns.fg = s.fg
-      ns.bold = s.bold
-      ns.italic = s.italic
-      ns.underline = s.underline
+    if type(s) == "string" then
+      s = maki.ui.theme_style(s) or {}
+    elseif type(s) ~= "table" then
+      s = {}
     end
-    out[#out + 1] = { sp[1], ns }
+    out[#out + 1] = {
+      sp[1],
+      {
+        bg = bg,
+        fg = s.fg,
+        bold = s.bold,
+        italic = s.italic,
+        underline = s.underline,
+        dim = s.dim,
+        strikethrough = s.strikethrough,
+        reversed = s.reversed,
+      },
+    }
   end
   return out
 end
@@ -731,10 +886,12 @@ local STATUS_STYLE =
 
 -- Shortens a path from the left to fit `max` columns.
 local function fit_path(path, max)
+  path = sanitize_utf8(path)
   if display_len(path) <= max then
     return path
   end
-  return "…" .. path:sub(-(max - 1))
+  local drop = math.max(display_len(path) - (max - 1), 1)
+  return "…" .. (split_cells(path, drop))
 end
 
 -- Builds a directory tree from a flat change list. Single-child directory
@@ -896,7 +1053,8 @@ local function render_commit_list(state)
   local active = state.pane == "commits" and not state.centry
   local lines, row_map = {}, {}
   if #state.commits == 0 then
-    lines[#lines + 1] = { { "  No commits.", "dim" } }
+    lines[#lines + 1] =
+      { { state.logerr and ("  " .. state.logerr) or "  No commits.", "dim" } }
   end
   for i, cm in ipairs(state.commits) do
     local rev = sanitize_utf8(cm.rev or "")
@@ -904,14 +1062,7 @@ local function render_commit_list(state)
     local subject = sanitize_utf8(cm.subject or "")
     local avail = width - #rev - display_len(when) - 4
     if display_len(subject) > avail then
-      local cut = math.max(avail - 1, 1)
-      -- Ensure `cut` lands on a UTF-8 boundary
-      while cut > 0 do
-        local ok, pos = pcall(utf8.offset, subject, 0, cut + 1)
-        if ok and pos == cut + 1 then break end
-        cut = cut - 1
-      end
-      subject = subject:sub(1, cut) .. "…"
+      subject = split_cells(subject, math.max(avail - 1, 1)) .. "…"
     end
     local spans = {
       { " " .. rev .. " ", "accent" },
@@ -945,7 +1096,7 @@ local function render_comment_list(state)
     lines[#lines + 1] = { { "  Press c on a diff line.", "dim" } }
   end
   for i, c in ipairs(comments) do
-    local ln = c.anchor == "old" and c.old_start or c.new_start
+    local _, ln = anchor_runs(c)
     local name = c.file:match("([^/]+)$") or c.file
     local loc = name .. ":" .. tostring(ln or "?")
     if c.commit then
@@ -960,7 +1111,7 @@ local function render_comment_list(state)
     if avail > 4 then
       local preview = c.text:gsub("%s+", " ")
       if display_len(preview) > avail then
-        preview = preview:sub(1, math.max(avail - 1, 1)) .. "…"
+        preview = split_cells(preview, math.max(avail - 1, 1)) .. "…"
       end
       spans[#spans + 1] = { " " .. preview, "dim" }
     end
@@ -996,7 +1147,7 @@ local function render_diff(state)
   end
 
   local dlines = state.dlines
-  if not dlines then
+  if not dlines or #dlines == 0 then
     lines[#lines + 1] = { { "", "" } }
     lines[#lines + 1] =
       { { "  " .. (state.diff_err or "No diff to show."), "dim" } }
@@ -1009,6 +1160,21 @@ local function render_diff(state)
     vfrom = math.min(state.vstart, state.vcur)
     vto = math.max(state.vstart, state.vcur)
   end
+
+  -- Each comment block is drawn once, below its last covered diff line.
+  local block_at = {}
+  for i, dl in ipairs(dlines) do
+    for _, c in ipairs(comments) do
+      if c.file == ch.path and c.commit == ch.commit and covers(c, dl) then
+        block_at[c] = i
+      end
+    end
+  end
+
+  -- load_preview targets a diff line; resolve it to a render row (rows and
+  -- diff lines diverge once comment blocks or the editor add rows).
+  local want = state.dwanted
+  state.dwanted = nil
 
   local editor_row = nil
   local active = state.pane == "diff"
@@ -1065,6 +1231,9 @@ local function render_diff(state)
 
     lines[#lines + 1] = spans
     row_map[#lines] = i
+    if want == i then
+      state.dcursor = #lines
+    end
     if active and #lines == state.dcursor and not state.centry then
       lines[#lines] = pad_spans(restyle(spans, "selected"), width, "selected")
     end
@@ -1087,24 +1256,21 @@ local function render_diff(state)
 
     -- Show the comment right below the last diff line it covers, in a
     -- full-width tinted block so it stands out from the code.
-    if c then
-      local nxt = dlines[i + 1]
-      if not (nxt and nxt.kind ~= "hunk" and covers(c, nxt)) then
-        local cbg = tint.com
-        local bar = { fg = COM_TINT[1], bg = cbg, bold = true }
-        local txt = cbg and { bg = cbg, bold = true } or "warning"
-        local hdr = { { "    ┏ ", bar }, { "● Comment", bar } }
+    if c and block_at[c] == i then
+      local cbg = tint.com
+      local bar = { fg = COM_TINT[1], bg = cbg, bold = true }
+      local txt = cbg and { bg = cbg, bold = true } or "warning"
+      local hdr = { { "    ┏ ", bar }, { "● Comment", bar } }
+      if cbg then
+        pad_spans(hdr, width, { bg = cbg })
+      end
+      lines[#lines + 1] = hdr
+      for _, cl in ipairs(wrap(c.text, math.max(width - 10, 20))) do
+        local cspans = { { COMMENT_BAR, bar }, { cl, txt } }
         if cbg then
-          pad_spans(hdr, width, { bg = cbg })
+          pad_spans(cspans, width, { bg = cbg })
         end
-        lines[#lines + 1] = hdr
-        for _, cl in ipairs(wrap(c.text, math.max(width - 10, 20))) do
-          local cspans = { { COMMENT_BAR, bar }, { cl, txt } }
-          if cbg then
-            pad_spans(cspans, width, { bg = cbg })
-          end
-          lines[#lines + 1] = cspans
-        end
+        lines[#lines + 1] = cspans
       end
     end
   end
@@ -1123,7 +1289,7 @@ local function render_commit_info(state)
   else
     local raw = state.cache["info:" .. cm.rev] or ""
     lines[#lines + 1] = { { "", "" } }
-    for l in (raw .. "\n"):gmatch("(.-)\n") do
+    for l in (sanitize_utf8(raw) .. "\n"):gmatch("(.-)\n") do
       local style = "item"
       if l:match("^commit ") or l:match("^Commit ID:") then
         style = "accent"
@@ -1154,7 +1320,7 @@ local function render_comment_detail(state)
     where = where .. "  ·  commit " .. c.commit
   end
   lines[#lines + 1] = { { "", "" } }
-  lines[#lines + 1] = { { " " .. c.file, "accent" } }
+  lines[#lines + 1] = { { " " .. sanitize_utf8(c.file), "accent" } }
   lines[#lines + 1] = { { " " .. where, "dim" } }
   lines[#lines + 1] = { { "", "" } }
   local cbg = tint.com
@@ -1348,6 +1514,7 @@ local function load_preview(state)
   state.vstart = nil
   state.centry = nil
   state.dcursor = 1
+  state.dwanted = nil
   state.sel_commit = nil
 
   if state.src == "comments" then
@@ -1357,7 +1524,9 @@ local function load_preview(state)
     local cm = state.commits[state.crow_map and state.crow_map[state.ccursor]]
     state.sel_commit = cm
     if cm and not state.cache["info:" .. cm.rev] then
-      state.cache["info:" .. cm.rev] = vcs_commit_info(cm.rev) or ""
+      local info, info_err = vcs_commit_info(cm.rev)
+      state.cache["info:" .. cm.rev] =
+        info or ("  failed to load commit info: " .. tostring(info_err))
     end
     return
   end
@@ -1400,11 +1569,12 @@ local function load_preview(state)
   state.dlines = cached.dlines
   state.hl = cached.hl
 
-  -- Cursor starts on the first changed (add/del) line.
+  -- Cursor starts on the first changed (add/del) line; render_diff resolves
+  -- it to the matching render row.
   state.dcursor = 1
   for i, dl in ipairs(cached.dlines) do
     if dl.kind == "add" or dl.kind == "del" then
-      state.dcursor = i
+      state.dwanted = i
       break
     end
   end
@@ -1412,11 +1582,19 @@ end
 
 local function refresh(state)
   state.cache = {}
-  state.wchanges = vcs_changes() or state.wchanges
-  state.commits = vcs_log() or state.commits
+  local wchanges, werr = vcs_changes()
+  state.wchanges = wchanges or state.wchanges
+  local commits, logerr = vcs_log()
+  state.commits = commits or state.commits
+  state.logerr = logerr
+  local err = werr or logerr
   if state.commit then
-    state.commit_changes =
-      vcs_commit_changes(state.commit.rev) or state.commit_changes
+    local cch, cerr = vcs_commit_changes(state.commit.rev)
+    state.commit_changes = cch or state.commit_changes
+    err = err or cerr
+  end
+  if err then
+    maki.ui.flash("refresh failed: " .. tostring(err))
   end
   redraw(state) -- rebuild row maps before reloading the preview
   load_preview(state)
@@ -1603,7 +1781,8 @@ local function open_comment_editor(state)
   end
 
   local input = TextInput.new()
-  local existing, existing_idx = comment_at(state.change, state.dlines[to])
+  local existing, existing_idx =
+    comment_in_range(state.change, state.dlines, from, to)
   local label
   if existing then
     input:insert_text(existing.text)
@@ -1744,6 +1923,7 @@ local function open_review()
     maki.ui.flash(tostring(err))
     return
   end
+  local commits, logerr = vcs_log()
 
   local state = {
     fbuf = maki.ui.buf(),
@@ -1753,7 +1933,8 @@ local function open_review()
     pane = "files",
     src = "files",
     wchanges = changes,
-    commits = vcs_log() or {},
+    commits = commits or {},
+    logerr = logerr,
     fcursor = 1,
     ccursor = 1,
     mcursor = 1,
