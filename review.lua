@@ -1,9 +1,11 @@
 -- /review: review maki's changes with inline comments.
 --
 -- Layout: a left column of three stacked panels + a right pane.
---   * Files    — changed files vs HEAD (staged, unstaged, untracked),
---     shown as a directory tree; Enter/l toggles a directory, h collapses.
---   * Commits  — recent commits; Enter drills into a commit's files (tree).
+--   * Files    — changed files vs HEAD (git: staged, unstaged, untracked) or
+--     the working-copy change vs its parent (jj), as a directory tree;
+--     Enter/l toggles a directory, h collapses.
+--   * Commits  — recent commits (git shas / jj change IDs); Enter drills
+--     into a commit's files (tree).
 --   * Comments — every review comment written so far (d deletes).
 --   * Right: syntax-highlighted diff of the selected file (previewed live),
 --     or the commit summary / comment detail for the other panels.
@@ -11,6 +13,10 @@
 --     In the diff: `c` comments the current line, `v` selects a range first,
 --     `d` deletes a comment.
 --   * `s` submits all comments to a new focused maki session that fixes them.
+--
+-- VCS backend: when a `.jj` directory marks the repository (searched upward
+-- from the working directory), every VCS query goes through jj and commits
+-- are identified by change ID; otherwise plain git is used.
 --
 -- After every turn, a status flash reminds you when files changed.
 --
@@ -97,7 +103,19 @@ local function get_tints()
   return tints
 end
 
---- git plumbing ------------------------------------------------------------
+--- vcs plumbing -------------------------------------------------------------
+
+-- Backend: jj when a `.jj` directory marks the repository (searched upward
+-- from the working directory), plain git otherwise. jj repositories are
+-- driven through jj commands only.
+local vcs -- "jj" | "git", resolved on first use
+
+local function vcs_backend()
+  if not vcs then
+    vcs = maki.fs.root(maki.uv.cwd() or ".", ".jj") and "jj" or "git"
+  end
+  return vcs
+end
 
 local function comment_count(change)
   local n = 0
@@ -107,6 +125,75 @@ local function comment_count(change)
     end
   end
   return n
+end
+
+-- Unescapes a C-quoted path from a git diff header ("a/path b/path").
+local function unquote_git_path(p)
+  if p:sub(1, 1) ~= '"' then
+    return p
+  end
+  p = p:sub(2, -2)
+  p = p:gsub("\\(%d%d?%d?)", function(o)
+    return string.char(tonumber(o, 8))
+  end)
+  return (p:gsub("\\(.)", {
+    a = "\a",
+    b = "\b",
+    f = "\f",
+    n = "\n",
+    r = "\r",
+    t = "\t",
+    v = "\v",
+    ["\\"] = "\\",
+    ['"'] = '"',
+  }))
+end
+
+-- Applies git numstat lines ("adds<TAB>dels<TAB>path") to name-status changes.
+local function apply_numstat(changes, seen, numstat)
+  for line in numstat:gmatch("[^\n]+") do
+    local adds, dels, path = line:match("^(%S+)\t(%S+)\t(.+)$")
+    if path then
+      local idx = seen[path]
+      if idx then
+        if adds == "-" then
+          changes[idx].binary = true
+        else
+          changes[idx].adds = tonumber(adds) or 0
+          changes[idx].dels = tonumber(dels) or 0
+        end
+      end
+    end
+  end
+end
+
+-- Applies per-file add/del counts and binary flags parsed from a
+-- `jj diff --git` listing to the changes built from `jj diff --summary`.
+local function apply_jj_stats(changes, seen, raw)
+  local cur, in_hunk = nil, false
+  for line in raw:gmatch("[^\n]*\n?") do
+    line = line:gsub("\n$", "")
+    local bpath = line:match('^diff %-%-git .* "b/(.+)"$')
+      or line:match("^diff %-%-git .* b/(.+)$")
+    if bpath then
+      local idx = seen[unquote_git_path(bpath)]
+      cur = idx and changes[idx] or nil
+      in_hunk = false
+    elseif cur then
+      if line:match("^@@") then
+        in_hunk = true
+      elseif line:match("^Binary files .* differ") then
+        cur.binary = true
+      elseif in_hunk then
+        local c = line:sub(1, 1)
+        if c == "+" then
+          cur.adds = cur.adds + 1
+        elseif c == "-" then
+          cur.dels = cur.dels + 1
+        end
+      end
+    end
+  end
 end
 
 -- Returns array of { path, status, adds, dels, untracked, binary } or nil, err.
@@ -129,21 +216,7 @@ local function git_changes()
     end
   end
 
-  local numstat = run("git diff --no-color --numstat HEAD") or ""
-  for line in numstat:gmatch("[^\n]+") do
-    local adds, dels, path = line:match("^(%S+)\t(%S+)\t(.+)$")
-    if path then
-      local idx = seen[path]
-      if idx then
-        if adds == "-" then
-          changes[idx].binary = true
-        else
-          changes[idx].adds = tonumber(adds) or 0
-          changes[idx].dels = tonumber(dels) or 0
-        end
-      end
-    end
-  end
+  apply_numstat(changes, seen, run("git diff --no-color --numstat HEAD") or "")
 
   local untracked = run("git ls-files --others --exclude-standard") or ""
   for path in untracked:gmatch("[^\n]+") do
@@ -159,28 +232,68 @@ local function git_changes()
   return changes
 end
 
--- Returns array of { sha, subject, when } or nil, err.
+-- jj: files of the working-copy change vs its parent. New files picked up by
+-- the snapshot appear as "A", so there is no separate untracked case.
+local function jj_changes()
+  local summary, err = run("jj diff --summary")
+  if not summary then
+    return nil, err
+  end
+  local changes, seen = {}, {}
+  for line in summary:gmatch("[^\n]+") do
+    local status, rest = line:match("^(%S)%s+(.+)$")
+    if status then
+      local path = rest:match("%{.* => (.*)%}$") or rest -- renames: new path
+      seen[path] = #changes + 1
+      changes[#changes + 1] =
+        { path = path, status = status, adds = 0, dels = 0 }
+    end
+  end
+  apply_jj_stats(changes, seen, run("jj diff --git") or "")
+  table.sort(changes, function(a, b)
+    return a.path < b.path
+  end)
+  return changes
+end
+
+-- Parses tab-separated "rev<TAB>subject<TAB>when" log lines.
+local function parse_log(out)
+  local log = {}
+  for line in out:gmatch("[^\n]+") do
+    local rev, subject, when = line:match("^(%S+)\t(.-)\t(.-)$")
+    if rev then
+      log[#log + 1] = { rev = rev, subject = subject, when = when }
+    end
+  end
+  return log
+end
+
+-- Returns array of { rev, subject, when } or nil, err. `rev` is a git sha.
 local function git_log()
   local out, err =
     run("git log --no-color -n 200 --pretty=format:'%h%x09%s%x09%ar'")
   if not out then
     return nil, err
   end
-  local log = {}
-  for line in out:gmatch("[^\n]+") do
-    local sha, subject, when = line:match("^(%S+)\t(.-)\t(.-)$")
-    if sha then
-      log[#log + 1] = { sha = sha, subject = subject, when = when }
-    end
+  return parse_log(out)
+end
+
+-- jj: change IDs (jj's stable identifiers) with relative timestamps.
+local function jj_log()
+  local out, err = run(
+    [[jj log --no-graph -r 'ancestors(@, 200)' -T 'change_id.short() ++ "\t" ++ description.first_line() ++ "\t" ++ self.committer().timestamp().ago() ++ "\n"']]
+  )
+  if not out then
+    return nil, err
   end
-  return log
+  return parse_log(out)
 end
 
 -- Files changed by one commit; same shape as git_changes, plus .commit.
-local function git_commit_changes(sha)
+local function git_commit_changes(rev)
   local changes, seen = {}, {}
   local ns, err =
-    run("git diff-tree -r --root --no-commit-id --name-status " .. sha)
+    run("git diff-tree -r --root --no-commit-id --name-status " .. rev)
   if not ns then
     return nil, err
   end
@@ -194,30 +307,66 @@ local function git_commit_changes(sha)
         status = status:sub(1, 1),
         adds = 0,
         dels = 0,
-        commit = sha,
+        commit = rev,
       }
     end
   end
-  local numstat =
-    run("git diff-tree -r --root --no-commit-id --numstat " .. sha) or ""
-  for line in numstat:gmatch("[^\n]+") do
-    local adds, dels, path = line:match("^(%S+)\t(%S+)\t(.+)$")
-    if path then
-      local idx = seen[path]
-      if idx then
-        if adds == "-" then
-          changes[idx].binary = true
-        else
-          changes[idx].adds = tonumber(adds) or 0
-          changes[idx].dels = tonumber(dels) or 0
-        end
-      end
-    end
-  end
+  apply_numstat(
+    changes,
+    seen,
+    run("git diff-tree -r --root --no-commit-id --numstat " .. rev) or ""
+  )
   table.sort(changes, function(a, b)
     return a.path < b.path
   end)
   return changes
+end
+
+-- jj: files changed by one change; same shape as jj_changes, plus .commit.
+local function jj_commit_changes(rev)
+  local summary, err = run("jj diff --summary -r " .. sh_quote(rev))
+  if not summary then
+    return nil, err
+  end
+  local changes, seen = {}, {}
+  for line in summary:gmatch("[^\n]+") do
+    local status, rest = line:match("^(%S)%s+(.+)$")
+    if status then
+      local path = rest:match("%{.* => (.*)%}$") or rest
+      seen[path] = #changes + 1
+      changes[#changes + 1] =
+        { path = path, status = status, adds = 0, dels = 0, commit = rev }
+    end
+  end
+  apply_jj_stats(changes, seen, run("jj diff --git -r " .. sh_quote(rev)) or "")
+  table.sort(changes, function(a, b)
+    return a.path < b.path
+  end)
+  return changes
+end
+
+-- Returns array of { path, status, adds, dels, untracked, binary } or nil, err.
+local function vcs_changes()
+  if vcs_backend() == "jj" then
+    return jj_changes()
+  end
+  return git_changes()
+end
+
+-- Returns array of { rev, subject, when } or nil, err.
+local function vcs_log()
+  if vcs_backend() == "jj" then
+    return jj_log()
+  end
+  return git_log()
+end
+
+-- Files changed by one commit/change; same shape as vcs_changes, plus .commit.
+local function vcs_commit_changes(rev)
+  if vcs_backend() == "jj" then
+    return jj_commit_changes(rev)
+  end
+  return git_commit_changes(rev)
 end
 
 -- Parses unified diff text into { kind, text, old_ln, new_ln } lines.
@@ -265,7 +414,16 @@ end
 
 local function get_diff(change)
   local cmd
-  if change.commit then
+  if vcs_backend() == "jj" then
+    if change.commit then
+      cmd = "jj diff --git -r "
+        .. sh_quote(change.commit)
+        .. " -- "
+        .. sh_quote(change.path)
+    else
+      cmd = "jj diff --git -- " .. sh_quote(change.path)
+    end
+  elseif change.commit then
     cmd = "git show --no-color --format= "
       .. change.commit
       .. " -- "
@@ -280,6 +438,14 @@ local function get_diff(change)
     return nil, err
   end
   return parse_diff(raw)
+end
+
+-- Human-readable commit summary (right pane while browsing commits).
+local function vcs_commit_info(rev)
+  if vcs_backend() == "jj" then
+    return run("jj show --stat " .. sh_quote(rev))
+  end
+  return run("git show --no-color --format=medium --stat " .. sh_quote(rev))
 end
 
 --- syntax highlighting -----------------------------------------------------
@@ -398,7 +564,8 @@ local function build_prompt()
 
   local p = {
     "I reviewed changes in this repository and left review comments. Comments refer either",
-    "to the uncommitted diff vs HEAD, or to a specific commit's diff (noted as `commit <sha>`).",
+    "to the uncommitted diff (vs HEAD / the parent change), or to a specific commit's diff",
+    "(noted as `commit <rev>`).",
     "Address every comment: apply the requested fix directly on the current working tree.",
     "If a comment is a question, answer it and apply any change the answer implies.",
     "Line numbers refer to the file content on the commented side of the diff",
@@ -723,10 +890,10 @@ local function render_commit_list(state)
     lines[#lines + 1] = { { "  No commits.", "dim" } }
   end
   for i, cm in ipairs(state.commits) do
-    local sha = sanitize_utf8(cm.sha or "")
+    local rev = sanitize_utf8(cm.rev or "")
     local when = sanitize_utf8(cm.when or ""):gsub(" ago$", "")
     local subject = sanitize_utf8(cm.subject or "")
-    local avail = width - #sha - display_len(when) - 4
+    local avail = width - #rev - display_len(when) - 4
     if display_len(subject) > avail then
       local cut = math.max(avail - 1, 1)
       -- Ensure `cut` lands on a UTF-8 boundary
@@ -738,7 +905,7 @@ local function render_commit_list(state)
       subject = subject:sub(1, cut) .. "…"
     end
     local spans = {
-      { " " .. sha .. " ", "accent" },
+      { " " .. rev .. " ", "accent" },
       { subject, "item" },
     }
     pad_spans(spans, width - display_len(when) - 1)
@@ -750,7 +917,7 @@ local function render_commit_list(state)
         lines[#lines] = pad_spans(restyle(spans, "selected"), width, "selected")
       else
         local marked = restyle(spans, "active")
-        marked[1] = { "▎" .. sha .. " ", "accent" }
+        marked[1] = { "▎" .. rev .. " ", "accent" }
         lines[#lines] = marked
       end
     end
@@ -945,13 +1112,13 @@ local function render_commit_info(state)
     lines[#lines + 1] = { { "", "" } }
     lines[#lines + 1] = { { "  Select a commit on the left.", "dim" } }
   else
-    local raw = state.cache["info:" .. cm.sha] or ""
+    local raw = state.cache["info:" .. cm.rev] or ""
     lines[#lines + 1] = { { "", "" } }
     for l in (raw .. "\n"):gmatch("(.-)\n") do
       local style = "item"
-      if l:match("^commit ") then
+      if l:match("^commit ") or l:match("^Commit ID:") then
         style = "accent"
-      elseif l:match("^%u[%w-]*:") then
+      elseif l:match("^%u[%w ]*:") then
         style = "dim"
       end
       lines[#lines + 1] = { { " " .. l, style } }
@@ -1103,7 +1270,7 @@ local function redraw(state)
 
   local ctitle, cfooter
   if state.commit then
-    ctitle = " " .. state.commit.sha .. " (" .. #(state.commit_changes or {}) .. ") "
+    ctitle = " " .. state.commit.rev .. " (" .. #(state.commit_changes or {}) .. ") "
     cfooter = { { "Enter", "diff" }, { "Esc", "back" } }
   else
     ctitle = " Commits "
@@ -1128,7 +1295,7 @@ local function redraw(state)
 
   local rtitle = " Diff "
   if state.src == "commits" and not state.commit then
-    rtitle = state.sel_commit and (" Commit " .. state.sel_commit.sha .. " ")
+    rtitle = state.sel_commit and (" Commit " .. state.sel_commit.rev .. " ")
       or " Commit "
   elseif state.src == "comments" then
     rtitle = " Comment "
@@ -1180,9 +1347,8 @@ local function load_preview(state)
   if state.src == "commits" and not state.commit then
     local cm = state.commits[state.crow_map and state.crow_map[state.ccursor]]
     state.sel_commit = cm
-    if cm and not state.cache["info:" .. cm.sha] then
-      state.cache["info:" .. cm.sha] =
-        run("git show --no-color --format=medium --stat " .. cm.sha) or ""
+    if cm and not state.cache["info:" .. cm.rev] then
+      state.cache["info:" .. cm.rev] = vcs_commit_info(cm.rev) or ""
     end
     return
   end
@@ -1237,11 +1403,11 @@ end
 
 local function refresh(state)
   state.cache = {}
-  state.wchanges = git_changes() or state.wchanges
-  state.commits = git_log() or state.commits
+  state.wchanges = vcs_changes() or state.wchanges
+  state.commits = vcs_log() or state.commits
   if state.commit then
     state.commit_changes =
-      git_commit_changes(state.commit.sha) or state.commit_changes
+      vcs_commit_changes(state.commit.rev) or state.commit_changes
   end
   redraw(state) -- rebuild row maps before reloading the preview
   load_preview(state)
@@ -1282,7 +1448,7 @@ local function enter_commit(state)
   if not cm then
     return
   end
-  local ch, err = git_commit_changes(cm.sha)
+  local ch, err = vcs_commit_changes(cm.rev)
   if not ch then
     maki.ui.flash("commit diff failed: " .. tostring(err))
     return
@@ -1564,7 +1730,7 @@ end
 --- main loop ---------------------------------------------------------------
 
 local function open_review()
-  local changes, err = git_changes()
+  local changes, err = vcs_changes()
   if not changes then
     maki.ui.flash(tostring(err))
     return
@@ -1578,7 +1744,7 @@ local function open_review()
     pane = "files",
     src = "files",
     wchanges = changes,
-    commits = git_log() or {},
+    commits = vcs_log() or {},
     fcursor = 1,
     ccursor = 1,
     mcursor = 1,
@@ -1751,19 +1917,24 @@ end
 
 maki.api.register_command({
   name = "/review",
-  description = "Review changes vs HEAD, comment on diff lines, send fixes to maki",
+  description = "Review working-tree changes and commits (git or jj), comment on diff lines, send fixes to maki",
   handler = open_review_safe,
 })
 
 
--- Nudge after each turn when the working tree changed.
+-- Nudge after each turn when the working copy changed.
 local last_sig = nil
 maki.api.create_autocmd("TurnEnd", {
   callback = function()
     maki.async.run(function()
-      local out = run(
-        "git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null"
-      )
+      local out
+      if vcs_backend() == "jj" then
+        out = run("jj diff --name-only")
+      else
+        out = run(
+          "git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null"
+        )
+      end
       if not out then
         return
       end

@@ -8,8 +8,10 @@ and sending them back to a new maki session that fixes them.
 
 ## Features
 
-- **Files** — changed files vs `HEAD` (staged, unstaged, untracked) as a collapsible tree
-- **Commits** — recent commits; drill into a commit's files
+- **Files** — changed files as a collapsible tree: vs `HEAD` (staged, unstaged,
+  untracked) with git, or the working-copy change vs its parent with jj
+- **Commits** — recent commits (git shas / jj change IDs); drill into a
+  commit's files
 - **Comments** — every review comment written so far
 - **Diff pane** — syntax-highlighted diff with full-row tints; comment a line (`c`),
   select a range first (`v`), delete (`d`)
@@ -29,6 +31,12 @@ and sending them back to a new maki session that fixes them.
 | `s` | submit comments to maki |
 | `r` | refresh |
 | `q` | quit |
+
+## Git and jj
+
+When a `.jj` directory marks the repository (searched upward from the working
+directory), the plugin uses only [Jujutsu](https://jj-vcs.github.io/) commands
+and identifies commits by change ID. Otherwise it falls back to git.
 
 ## Install
 
